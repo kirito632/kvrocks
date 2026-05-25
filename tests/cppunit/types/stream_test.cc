@@ -2691,3 +2691,103 @@ TEST_F(RedisStreamTest, DestroyGroupDoesNotAffectOtherGroups) {
   s = stream_->Del(*ctx_, stream_name);
   EXPECT_TRUE(s.ok());
 }
+
+TEST_F(RedisStreamTest, DeleteEntriesWithOptionEmptyIDs) {
+  redis::StreamAddOptions add_options;
+  add_options.next_id_strategy = *ParseNextStreamEntryIDStrategy("12345-6789");
+  std::vector<std::string> values = {"key1", "val1"};
+  redis::StreamEntryID id;
+  auto s = stream_->Add(*ctx_, name_, add_options, values, &id);
+  EXPECT_TRUE(s.ok());
+
+  std::vector<int> results;
+  s = stream_->DeleteEntriesWithOption(*ctx_, name_, {}, redis::StreamDeleteOption::KeepRef, &results);
+  EXPECT_TRUE(s.ok());
+  EXPECT_TRUE(results.empty());
+}
+
+TEST_F(RedisStreamTest, DeleteEntriesWithOptionKeepRef) {
+  redis::StreamAddOptions add_options;
+  add_options.next_id_strategy = *ParseNextStreamEntryIDStrategy("12345-6789");
+  std::vector<std::string> values = {"key1", "val1"};
+  redis::StreamEntryID id;
+  auto s = stream_->Add(*ctx_, name_, add_options, values, &id);
+  EXPECT_TRUE(s.ok());
+
+  std::vector<int> results;
+  s = stream_->DeleteEntriesWithOption(*ctx_, name_, {id}, redis::StreamDeleteOption::KeepRef, &results);
+  EXPECT_TRUE(s.ok());
+  ASSERT_EQ(results.size(), 1);
+  EXPECT_EQ(results[0], static_cast<int>(redis::StreamEntryDeleteResult::kEntryDeleted));
+}
+
+TEST_F(RedisStreamTest, DeleteEntriesWithOptionNonExistentEntry) {
+  // Tests the !batch_modified early return path
+  redis::StreamAddOptions add_options;
+  add_options.next_id_strategy = *ParseNextStreamEntryIDStrategy("12345-6789");
+  std::vector<std::string> values = {"key1", "val1"};
+  redis::StreamEntryID id;
+  auto s = stream_->Add(*ctx_, name_, add_options, values, &id);
+  EXPECT_TRUE(s.ok());
+
+  std::vector<int> results;
+  s = stream_->DeleteEntriesWithOption(*ctx_, name_, {redis::StreamEntryID{999, 999}},
+                                       redis::StreamDeleteOption::KeepRef, &results);
+  EXPECT_TRUE(s.ok());
+  ASSERT_EQ(results.size(), 1);
+  EXPECT_EQ(results[0], static_cast<int>(redis::StreamEntryDeleteResult::kEntryNotFound));
+}
+
+TEST_F(RedisStreamTest, DeleteEntriesWithOptionDelRef) {
+  redis::StreamAddOptions add_options;
+  add_options.next_id_strategy = *ParseNextStreamEntryIDStrategy("12345-6789");
+  std::vector<std::string> values = {"key1", "val1"};
+  redis::StreamEntryID id;
+  auto s = stream_->Add(*ctx_, name_, add_options, values, &id);
+  EXPECT_TRUE(s.ok());
+
+  redis::StreamXGroupCreateOptions create_options = {false, 0, "0-0"};
+  s = stream_->CreateGroup(*ctx_, name_, create_options, "test_group");
+  EXPECT_TRUE(s.ok());
+
+  std::vector<int> results;
+  s = stream_->DeleteEntriesWithOption(*ctx_, name_, {id}, redis::StreamDeleteOption::DelRef, &results);
+  EXPECT_TRUE(s.ok());
+  ASSERT_EQ(results.size(), 1);
+  EXPECT_EQ(results[0], static_cast<int>(redis::StreamEntryDeleteResult::kEntryDeleted));
+}
+
+TEST_F(RedisStreamTest, DeleteEntriesWithOptionAckedNoGroup) {
+  // ACKED with no groups should skip the entry
+  redis::StreamAddOptions add_options;
+  add_options.next_id_strategy = *ParseNextStreamEntryIDStrategy("12345-6789");
+  std::vector<std::string> values = {"key1", "val1"};
+  redis::StreamEntryID id;
+  auto s = stream_->Add(*ctx_, name_, add_options, values, &id);
+  EXPECT_TRUE(s.ok());
+
+  std::vector<int> results;
+  s = stream_->DeleteEntriesWithOption(*ctx_, name_, {id}, redis::StreamDeleteOption::Acked, &results);
+  EXPECT_TRUE(s.ok());
+  ASSERT_EQ(results.size(), 1);
+  EXPECT_EQ(results[0], static_cast<int>(redis::StreamEntryDeleteResult::kEntrySkipped));
+}
+
+TEST_F(RedisStreamTest, DeleteEntriesWithOptionDeleteFirstEntryBoundary) {
+  // Delete the first entry from a multi-entry stream to test boundary recalculation
+  redis::StreamAddOptions add_options;
+  add_options.next_id_strategy = *ParseNextStreamEntryIDStrategy("100-0");
+  redis::StreamEntryID id1;
+  auto s = stream_->Add(*ctx_, name_, add_options, {"k1", "v1"}, &id1);
+  EXPECT_TRUE(s.ok());
+  add_options.next_id_strategy = *ParseNextStreamEntryIDStrategy("200-0");
+  redis::StreamEntryID id2;
+  s = stream_->Add(*ctx_, name_, add_options, {"k2", "v2"}, &id2);
+  EXPECT_TRUE(s.ok());
+
+  std::vector<int> results;
+  s = stream_->DeleteEntriesWithOption(*ctx_, name_, {id1}, redis::StreamDeleteOption::KeepRef, &results);
+  EXPECT_TRUE(s.ok());
+  ASSERT_EQ(results.size(), 1);
+  EXPECT_EQ(results[0], static_cast<int>(redis::StreamEntryDeleteResult::kEntryDeleted));
+}
