@@ -266,6 +266,21 @@ rocksdb::Status WriteBatchExtractor::PutCF(uint32_t column_family_id, const Slic
         break;
     }
   } else if (column_family_id == static_cast<uint32_t>(ColumnFamilyID::Stream)) {
+    InternalKey ikey(key, is_slot_id_encoded_);
+    Slice entry_id_check = ikey.GetSubKey();
+    uint64_t delimiter = 0;
+    GetFixed64(&entry_id_check, &delimiter);
+    if (delimiter == UINT64_MAX) {
+      return rocksdb::Status::OK();
+    }
+
+    user_key = ikey.GetKey().ToString();
+    auto key_slot_id = GetSlotIdFromKey(user_key);
+    if (slot_range_.IsValid() && !slot_range_.Contains(key_slot_id)) {
+      return rocksdb::Status::OK();
+    }
+    ns = ikey.GetNamespace().ToString();
+
     auto s = ExtractStreamAddCommand(is_slot_id_encoded_, key, value, &command_args);
     if (!s.IsOK()) {
       ERROR("Failed to parse write_batch in PutCF. Type=Stream: {}", s.Msg());
@@ -397,8 +412,31 @@ rocksdb::Status WriteBatchExtractor::DeleteCF(uint32_t column_family_id, const S
     Slice encoded_id = ikey.GetSubKey();
     redis::StreamEntryID entry_id;
     GetFixed64(&encoded_id, &entry_id.ms);
+
+    if (entry_id.ms == UINT64_MAX) {
+      return rocksdb::Status::OK();
+    }
+
     GetFixed64(&encoded_id, &entry_id.seq);
-    command_args = {"XDEL", ikey.GetKey().ToString(), entry_id.ToString()};
+    std::string entry_id_str = entry_id.ToString();
+    std::string user_key = ikey.GetKey().ToString();
+
+    auto key_slot_id = GetSlotIdFromKey(user_key);
+    if (slot_range_.IsValid() && !slot_range_.Contains(key_slot_id)) {
+      return rocksdb::Status::OK();
+    }
+    ns = ikey.GetNamespace().ToString();
+
+    auto args = log_data_.GetArguments();
+    if (!args->empty()) {
+      if ((*args)[0] == "XACKDEL" && args->size() >= 3) {
+        command_args = {(*args)[0], user_key, (*args)[1], (*args)[2], "IDS", "1", entry_id_str};
+      } else {
+        command_args = {"XDEL", user_key, entry_id_str};
+      }
+    } else {
+      command_args = {"XDEL", user_key, entry_id_str};
+    }
   }
 
   if (!command_args.empty()) {
