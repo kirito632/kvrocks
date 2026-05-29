@@ -310,6 +310,10 @@ class CommandXAckDel : public Commander {
       entry_ids_.emplace_back(id);
     }
 
+    if (parser.Good()) {
+      return {Status::RedisParseErr, "syntax error, unexpected trailing arguments after IDs"};
+    }
+
     return Status::OK();
   }
 
