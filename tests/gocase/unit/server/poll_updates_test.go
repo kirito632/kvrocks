@@ -176,6 +176,13 @@ func TestPollUpdates_WithRESPFormat(t *testing.T) {
 	defer func() { require.NoError(t, rdb0.Close()) }()
 
 	var pollUpdates *PollUpdatesResult
+	nextPollSeq := func() int64 {
+		if pollUpdates == nil {
+			return 0
+		}
+		return pollUpdates.NextSeq
+	}
+
 	t.Run("String type", func(t *testing.T) {
 		require.NoError(t, rdb0.Set(ctx, "k0", "v0", 0).Err())
 		require.NoError(t, rdb0.Set(ctx, "k1", "v1", 0).Err())
@@ -200,7 +207,7 @@ func TestPollUpdates_WithRESPFormat(t *testing.T) {
 	t.Run("Hash type", func(t *testing.T) {
 		require.NoError(t, rdb0.HSet(ctx, "h0", "f0", "v0", "f1", "v1").Err())
 		require.NoError(t, rdb0.HDel(ctx, "h0", "f1").Err())
-		result, err := rdb0.Do(ctx, "POLLUPDATES", pollUpdates.NextSeq, "MAX", 10, "FORMAT", "RESP").Result()
+		result, err := rdb0.Do(ctx, "POLLUPDATES", nextPollSeq(), "MAX", 10, "FORMAT", "RESP").Result()
 		require.NoError(t, err)
 
 		pollUpdates = parsePollUpdatesResult(t, result.(map[any]any), true)
@@ -218,7 +225,7 @@ func TestPollUpdates_WithRESPFormat(t *testing.T) {
 	t.Run("List type", func(t *testing.T) {
 		require.NoError(t, rdb0.LPush(ctx, "l0", "v0", "v1").Err())
 		require.NoError(t, rdb0.LSet(ctx, "l0", 1, "v2").Err())
-		result, err := rdb0.Do(ctx, "POLLUPDATES", pollUpdates.NextSeq, "MAX", 10, "FORMAT", "RESP").Result()
+		result, err := rdb0.Do(ctx, "POLLUPDATES", nextPollSeq(), "MAX", 10, "FORMAT", "RESP").Result()
 		require.NoError(t, err)
 
 		pollUpdates = parsePollUpdatesResult(t, result.(map[any]any), true)
@@ -236,7 +243,7 @@ func TestPollUpdates_WithRESPFormat(t *testing.T) {
 	t.Run("Set type", func(t *testing.T) {
 		require.NoError(t, rdb0.SAdd(ctx, "s0", "v0", "v1").Err())
 		require.NoError(t, rdb0.SRem(ctx, "s0", "v1").Err())
-		result, err := rdb0.Do(ctx, "POLLUPDATES", pollUpdates.NextSeq, "MAX", 10, "FORMAT", "RESP").Result()
+		result, err := rdb0.Do(ctx, "POLLUPDATES", nextPollSeq(), "MAX", 10, "FORMAT", "RESP").Result()
 		require.NoError(t, err)
 
 		pollUpdates = parsePollUpdatesResult(t, result.(map[any]any), true)
@@ -255,7 +262,7 @@ func TestPollUpdates_WithRESPFormat(t *testing.T) {
 		require.NoError(t, rdb0.ZAdd(ctx, "z0", redis.Z{Member: "v0", Score: 1.2}).Err())
 		require.NoError(t, rdb0.ZAdd(ctx, "z0", redis.Z{Member: "v1", Score: 1.2}).Err())
 		require.NoError(t, rdb0.ZRem(ctx, "z0", "v1").Err())
-		result, err := rdb0.Do(ctx, "POLLUPDATES", pollUpdates.NextSeq, "MAX", 10, "FORMAT", "RESP").Result()
+		result, err := rdb0.Do(ctx, "POLLUPDATES", nextPollSeq(), "MAX", 10, "FORMAT", "RESP").Result()
 		require.NoError(t, err)
 
 		pollUpdates = parsePollUpdatesResult(t, result.(map[any]any), true)
@@ -277,7 +284,7 @@ func TestPollUpdates_WithRESPFormat(t *testing.T) {
 		}).Result()
 		require.NoError(t, err)
 		require.NoError(t, rdb0.XDel(ctx, "stream", id).Err())
-		result, err := rdb0.Do(ctx, "POLLUPDATES", pollUpdates.NextSeq, "MAX", 10, "FORMAT", "RESP").Result()
+		result, err := rdb0.Do(ctx, "POLLUPDATES", nextPollSeq(), "MAX", 10, "FORMAT", "RESP").Result()
 		require.NoError(t, err)
 
 		pollUpdates = parsePollUpdatesResult(t, result.(map[any]any), true)
@@ -301,7 +308,38 @@ func TestPollUpdates_WithRESPFormat(t *testing.T) {
 		_, err := rdb0.Do(ctx, "XDELEX", streamName, "KEEPREF", "IDS", "1", "1-0").Result()
 		require.NoError(t, err)
 
-		result, err := rdb0.Do(ctx, "POLLUPDATES", pollUpdates.NextSeq, "MAX", 10, "FORMAT", "RESP").Result()
+		result, err := rdb0.Do(ctx, "POLLUPDATES", nextPollSeq(), "MAX", 10, "FORMAT", "RESP").Result()
+		require.NoError(t, err)
+
+		pollUpdates = parsePollUpdatesResult(t, result.(map[any]any), true)
+		require.Len(t, pollUpdates.Updates, 1)
+		require.EqualValues(t, []any{RESPFormat{
+			Namespace: "default",
+			Commands: [][]string{
+				{"XADD", streamName, "1-0", "field", "value"},
+				{"XDELEX", streamName, "KEEPREF", "IDS", "1", "1-0"},
+			},
+		}}, pollUpdates.Updates)
+	})
+
+	t.Run("Stream XDELEX ACKED entry deletion emits KEEPREF", func(t *testing.T) {
+		streamName := "stream_xdelex_acked"
+		require.NoError(t, rdb0.XAdd(ctx, &redis.XAddArgs{
+			Stream: streamName,
+			ID:     "1-0",
+			Values: map[string]interface{}{"field": "value"},
+		}).Err())
+		require.NoError(t, rdb0.XGroupCreateMkStream(ctx, streamName, "group", "0").Err())
+		_, err := rdb0.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group: "group", Consumer: "consumer", Streams: []string{streamName, ">"}, Count: 1,
+		}).Result()
+		require.NoError(t, err)
+		require.NoError(t, rdb0.XAck(ctx, streamName, "group", "1-0").Err())
+		r, err := rdb0.Do(ctx, "XDELEX", streamName, "ACKED", "IDS", "1", "1-0").Result()
+		require.NoError(t, err)
+		require.Equal(t, []interface{}{int64(1)}, r)
+
+		result, err := rdb0.Do(ctx, "POLLUPDATES", nextPollSeq(), "MAX", 10, "FORMAT", "RESP").Result()
 		require.NoError(t, err)
 
 		pollUpdates = parsePollUpdatesResult(t, result.(map[any]any), true)
@@ -331,7 +369,7 @@ func TestPollUpdates_WithRESPFormat(t *testing.T) {
 		_, err = rdb0.Do(ctx, "XDELEX", streamName, "DELREF", "IDS", "1", "1-0").Result()
 		require.NoError(t, err)
 
-		result, err := rdb0.Do(ctx, "POLLUPDATES", pollUpdates.NextSeq, "MAX", 10, "FORMAT", "RESP").Result()
+		result, err := rdb0.Do(ctx, "POLLUPDATES", nextPollSeq(), "MAX", 10, "FORMAT", "RESP").Result()
 		require.NoError(t, err)
 
 		pollUpdates = parsePollUpdatesResult(t, result.(map[any]any), true)
@@ -346,10 +384,44 @@ func TestPollUpdates_WithRESPFormat(t *testing.T) {
 		}, pollUpdates.Updates)
 	})
 
+	t.Run("Stream XDELEX DELREF multi-group PEL emits one command", func(t *testing.T) {
+		streamName := "stream_xdelex_multi_pel"
+		require.NoError(t, rdb0.XAdd(ctx, &redis.XAddArgs{
+			Stream: streamName,
+			ID:     "1-0",
+			Values: map[string]interface{}{"field": "value"},
+		}).Err())
+		require.NoError(t, rdb0.XGroupCreateMkStream(ctx, streamName, "group1", "0").Err())
+		require.NoError(t, rdb0.XGroupCreateMkStream(ctx, streamName, "group2", "0").Err())
+		_, err := rdb0.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group: "group1", Consumer: "consumer1", Streams: []string{streamName, ">"}, Count: 1,
+		}).Result()
+		require.NoError(t, err)
+		_, err = rdb0.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group: "group2", Consumer: "consumer2", Streams: []string{streamName, ">"}, Count: 1,
+		}).Result()
+		require.NoError(t, err)
+		_, err = rdb0.Do(ctx, "XDELEX", streamName, "DELREF", "IDS", "1", "1-0").Result()
+		require.NoError(t, err)
+
+		result, err := rdb0.Do(ctx, "POLLUPDATES", nextPollSeq(), "MAX", 10, "FORMAT", "RESP").Result()
+		require.NoError(t, err)
+
+		pollUpdates = parsePollUpdatesResult(t, result.(map[any]any), true)
+		require.Len(t, pollUpdates.Updates, 1)
+		require.EqualValues(t, []any{RESPFormat{
+			Namespace: "default",
+			Commands: [][]string{
+				{"XADD", streamName, "1-0", "field", "value"},
+				{"XDELEX", streamName, "DELREF", "IDS", "1", "1-0"},
+			}},
+		}, pollUpdates.Updates)
+	})
+
 	t.Run("JSON type", func(t *testing.T) {
 		require.NoError(t, rdb0.JSONSet(ctx, "json", "$", `{"field": "value"}`).Err())
 		require.NoError(t, rdb0.JSONDel(ctx, "json", "$.field").Err())
-		result, err := rdb0.Do(ctx, "POLLUPDATES", pollUpdates.NextSeq, "MAX", 10, "FORMAT", "RESP").Result()
+		result, err := rdb0.Do(ctx, "POLLUPDATES", nextPollSeq(), "MAX", 10, "FORMAT", "RESP").Result()
 		require.NoError(t, err)
 
 		pollUpdates = parsePollUpdatesResult(t, result.(map[any]any), true)
